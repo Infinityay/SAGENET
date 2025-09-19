@@ -120,10 +120,11 @@ class ProtocolTrainer:
         }
         
     def train_epoch(self):
-        """训练一个epoch - 使用改进的分组共识评估"""
+        """训练一个epoch - 使用单条流量微平均评估"""
         self.model.train()
         total_loss = 0
-        protocol_results = {}
+        all_preds = []
+        all_labels = []
         
         progress_bar = tqdm(self.train_loader, desc="Training")
         
@@ -165,38 +166,28 @@ class ProtocolTrainer:
                 'loss': ce_loss.item()
             })
             
-            # 收集预测结果用于计算共识指标
+            # 收集预测结果用于计算微平均指标
             with torch.no_grad():
                 preds = torch.argmax(logits, dim=2)
                 mask = labels != -100
                 
+                # 扁平化收集所有有效的预测和标签
                 for i in range(len(protocols)):
-                    protocol = protocols[i]
                     sample_mask = mask[i]
                     
                     if sample_mask.any():
                         sample_preds = preds[i][sample_mask].cpu().numpy()
                         sample_labels = labels[i][sample_mask].cpu().numpy()
-
-                        if protocol not in protocol_results:
-                            protocol_results[protocol] = {'preds': [], 'labels': []}
                         
-                        protocol_results[protocol]['preds'].append(sample_preds.tolist())
-                        protocol_results[protocol]['labels'].append(sample_labels.tolist())
+                        all_preds.extend(sample_preds.tolist())
+                        all_labels.extend(sample_labels.tolist())
         
         # 计算平均损失
         avg_loss = total_loss / len(self.train_loader)
         
-        # 使用改进的分组共识评估计算训练F1
-        protocol_f1_scores = []
-        for protocol, data in protocol_results.items():
-            if data['labels'] and len(data['preds']) >= 1:
-                metrics = self.evaluate_consensus_prediction(
-                    data['preds'], data['labels'], threshold_ratio=0.5
-                )
-                protocol_f1_scores.append(metrics['f1'])
-        
-        train_f1 = np.mean(protocol_f1_scores) if protocol_f1_scores else 0.0
+        # 使用微平均计算训练F1
+        train_metrics = self.calculate_byte_level_metrics(all_preds, all_labels)
+        train_f1 = train_metrics['f1']
         
         # 记录损失
         logger.info(f"训练损失: {avg_loss:.4f}")
@@ -204,7 +195,7 @@ class ProtocolTrainer:
         return avg_loss, train_f1
     
     def validate(self, data_loader, desc="Validation"):
-        """验证模型 -  使用改进的分组共识评估"""
+        """验证模型 - 使用单条流量微平均评估"""
         self.model.eval()
         total_loss = 0
         protocol_results = {}
@@ -235,7 +226,7 @@ class ProtocolTrainer:
                 preds = torch.argmax(logits, dim=2)
                 mask = labels != -100
 
-                # 收集预测结果
+                # 按协议收集预测结果（扁平化）
                 for i in range(len(protocols)):
                     protocol = protocols[i]
                     sample_mask = mask[i]
@@ -247,24 +238,25 @@ class ProtocolTrainer:
                         if protocol not in protocol_results:
                             protocol_results[protocol] = {'preds': [], 'labels': []}
                         
-                        protocol_results[protocol]['preds'].append(sample_preds.tolist())
-                        protocol_results[protocol]['labels'].append(sample_labels.tolist())
+                        # 扁平化收集每个样本的预测结果
+                        protocol_results[protocol]['preds'].extend(sample_preds.tolist())
+                        protocol_results[protocol]['labels'].extend(sample_labels.tolist())
 
         avg_loss = total_loss / len(data_loader)
 
-        # 计算每个协议的分组分组共识指标
+        # 计算每个协议的微平均指标
         protocol_metrics = {}
         
         for protocol, data in protocol_results.items():
-            if data['labels'] and len(data['preds']) >= 1:
-                # 使用改进的分组改进的分组共识评估
-                metrics = self.evaluate_consensus_prediction(
-                    data['preds'], data['labels'], threshold_ratio=0.5
+            if data['labels'] and data['preds']:
+                # 使用微平均计算每个协议的指标
+                metrics = self.calculate_byte_level_metrics(
+                    data['preds'], data['labels']
                 )
                 protocol_metrics[protocol] = metrics
                 
                 
-        # 计算总体指标 - 从各协议指标计算平均值
+        # 计算总体指标 - 使用宏平均（协议间平均）
         if protocol_metrics:
             overall_metrics = {
                 'precision': np.mean([m['precision'] for m in protocol_metrics.values()]),
@@ -320,86 +312,6 @@ class ProtocolTrainer:
             'fn': int(fn)
         }
     
-    def evaluate_consensus_prediction(self, predictions: list, ground_truths: list, threshold_ratio=0.5):
-        """改进的共识评估：按长度分组分别计算共识，然后加权平均"""
-        if len(predictions) < 2:
-            return self.calculate_byte_level_metrics(
-                [item for sublist in predictions for item in sublist],
-                [item for sublist in ground_truths for item in sublist]
-            )
-
-        # Step 1: 按长度分组
-        length_groups = {}
-        for pred, gt in zip(predictions, ground_truths):
-            length = len(pred)
-            if length not in length_groups:
-                length_groups[length] = {'preds': [], 'gts': [], 'count': 0}
-            length_groups[length]['preds'].append(pred)
-            length_groups[length]['gts'].append(gt)
-            length_groups[length]['count'] += 1
-        
-        logger.debug(f"长度分布: {[(length, group['count']) for length, group in length_groups.items()]}")
-        
-        # Step 2: 对每个长度组分别计算共识
-        group_metrics = {}
-        total_samples = sum(group['count'] for group in length_groups.values())
-        
-        for length, group in length_groups.items():
-            if group['count'] >= 2:  # 至少需要2个样本才能计算共识
-                # 计算该长度组的共识
-                consensus_pred = self._calculate_consensus_sequence(group['preds'], threshold_ratio)
-                consensus_gt = self._calculate_consensus_sequence(group['gts'], 0.5)
-                
-                metrics = self.calculate_byte_level_metrics(consensus_pred, consensus_gt)
-                metrics['sample_count'] = group['count']
-                metrics['weight'] = group['count'] / total_samples
-                group_metrics[length] = metrics
-                
-                logger.debug(f"长度{length}: {group['count']}个样本, F1={metrics['f1']:.4f}, 权重={metrics['weight']:.3f}")
-        
-        # Step 3: 加权平均计算总体指标
-        if not group_metrics:
-            logger.warning("没有足够样本的长度组进行共识评估")
-            return {'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'tp': 0, 'fp': 0, 'fn': 0}
-        
-        weighted_precision = sum(m['precision'] * m['weight'] for m in group_metrics.values())
-        weighted_recall = sum(m['recall'] * m['weight'] for m in group_metrics.values())
-        weighted_f1 = sum(m['f1'] * m['weight'] for m in group_metrics.values())
-        
-        total_tp = sum(m['tp'] for m in group_metrics.values())
-        total_fp = sum(m['fp'] for m in group_metrics.values())
-        total_fn = sum(m['fn'] for m in group_metrics.values())
-        
-        # 记录详细信息
-        length_info = [f"{length}字节:{group['count']}个" for length, group in length_groups.items()]
-        logger.debug(f"分组共识评估完成 - {', '.join(length_info)}")
-        
-        return {
-            'precision': weighted_precision,
-            'recall': weighted_recall,
-            'f1': weighted_f1,
-            'tp': total_tp,
-            'fp': total_fp,
-            'fn': total_fn,
-            'length_groups': group_metrics,
-            'total_samples': total_samples
-        }
-    
-    
-    def _calculate_consensus_sequence(self, sequences, threshold_ratio):
-        """计算序列的共识"""
-        if not sequences:
-            return []
-        
-        length = len(sequences[0])
-        num_sequences = len(sequences)
-        consensus = []
-        
-        for pos in range(length):
-            votes = sum(seq[pos] for seq in sequences)
-            consensus.append(1 if votes >= (num_sequences * threshold_ratio) else 0)
-        
-        return consensus
     
     def save_best_model(self, epoch, val_f1, val_loss, val_precision, val_recall):
         """保存最佳模型：F1最高，F1相同时选择val loss最低的"""
@@ -655,9 +567,9 @@ class ProtocolTrainer:
         return test_results
 
     def show_protocol_examples(self):
-        """展示各协议的共识预测格式 - 详细分析版本"""
+        """展示各协议的预测格式示例"""
         logger.info("\n" + "="*80)
-        logger.info("协议共识格式分析")
+        logger.info("协议格式预测示例")
         logger.info("="*80)
 
         self.model.eval()
@@ -665,14 +577,12 @@ class ProtocolTrainer:
         from config import PROTOCOLS
         target_protocols = PROTOCOLS
         
-        protocol_consensus = {}
-        
         if self.test_loader is None:
             logger.info("没有测试集数据")
             return
 
         with torch.no_grad():
-            protocol_results = {}
+            protocol_examples = {}
             
             for batch in self.test_loader:
                 # 统一处理输入
@@ -694,8 +604,6 @@ class ProtocolTrainer:
                     attention_mask=attention_mask
                 )
 
-       
-
                 preds = torch.argmax(logits, dim=2)
                 mask = labels != -100
 
@@ -704,229 +612,50 @@ class ProtocolTrainer:
                     sample_mask = mask[i]
                     
                     if sample_mask.any() and protocol in target_protocols:
-                        sample_preds = preds[i][sample_mask].cpu().numpy()
-                        sample_labels = labels[i][sample_mask].cpu().numpy()
-                        sample_bits = bit_matrices[i][sample_mask].cpu().numpy()
-
-                        if protocol not in protocol_results:
-                            protocol_results[protocol] = {
-                                'preds': [], 'labels': [], 'bits': []
+                        # 只收集第一个样本作为示例
+                        if protocol not in protocol_examples:
+                            sample_preds = preds[i][sample_mask].cpu().numpy()
+                            sample_labels = labels[i][sample_mask].cpu().numpy()
+                            sample_bits = bit_matrices[i][sample_mask].cpu().numpy()
+                            
+                            protocol_examples[protocol] = {
+                                'preds': sample_preds,
+                                'labels': sample_labels,
+                                'bits': sample_bits
                             }
-                        
-                        protocol_results[protocol]['preds'].append(sample_preds.tolist())
-                        protocol_results[protocol]['labels'].append(sample_labels.tolist())
-                        protocol_results[protocol]['bits'].append(sample_bits)
 
-            # 计算每个协议的共识格式（按长度分组）
-            for protocol, data in protocol_results.items():
-                if len(data['preds']) >= 2:
-                    # 按长度分组分析
-                    length_groups = {}
-                    for i, pred in enumerate(data['preds']):
-                        length = len(pred)
-                        if length not in length_groups:
-                            length_groups[length] = {'count': 0, 'preds': [], 'labels': [], 'bits': []}
-                        length_groups[length]['count'] += 1
-                        length_groups[length]['preds'].append(pred)
-                        length_groups[length]['labels'].append(data['labels'][i])
-                        length_groups[length]['bits'].append(data['bits'][i])
-                    
-                    protocol_consensus[protocol] = length_groups
-
-        # 显示各协议的详细分析
+        # 显示各协议的示例
         for protocol in target_protocols:
-            if protocol in protocol_consensus:
-                logger.info(f"\n--- {protocol.upper()} 协议 ---")
-                length_groups = protocol_consensus[protocol]
+            if protocol in protocol_examples:
+                logger.info(f"\n--- {protocol.upper()} 协议示例 ---")
+                example = protocol_examples[protocol]
                 
-                # 找到样本数最多的组
-                max_count = 0
-                best_group = None
-                best_length = None
+                # 重构十六进制数据
+                hex_data = ""
+                for i in range(len(example['bits'])):
+                    byte_bits = example['bits'][i]
+                    byte_value = 0
+                    for j in range(8):
+                        if byte_bits[j] > 0.5:
+                            byte_value |= (1 << (7-j))
+                    hex_data += f"{byte_value:02x}"
                 
-                for length, group in length_groups.items():
-                    if group['count'] > max_count and group['count'] >= 2:  # 至少2个样本
-                        max_count = group['count']
-                        best_group = group
-                        best_length = length
+                pred_format = self._format_fields(hex_data, example['preds'])
+                true_format = self._format_fields(hex_data, example['labels'])
                 
-                if best_group:
-                    # 显示基本信息
-                    logger.info(f"样本数: {max_count}")
-                    logger.info(f"有效长度: {best_length}")
-                    
-                    # 获取共识格式
-                    pred_format, true_format, detailed_stats = self._get_detailed_consensus_format(
-                        best_group['preds'], best_group['labels'], best_group['bits'][0]
-                    )
-                    
-                    logger.info(f"  预测格式: {pred_format}")
-                    logger.info(f"  真实格式: {true_format}")
-                    
-                    # 显示详细的投票统计
-                    self._show_voting_statistics(detailed_stats, max_count)
-                    
-                    # 显示边界位置摘要
-                    self._show_boundary_summary(detailed_stats)
-                    
-                else:
-                    logger.info("没有足够样本的长度组进行分析")
+                logger.info(f"数据长度: {len(example['preds'])} 字节")
+                logger.info(f"预测格式: {pred_format}")
+                logger.info(f"真实格式: {true_format}")
+                
+                # 显示边界位置
+                pred_boundaries = [i for i, label in enumerate(example['preds']) if label == 1]
+                true_boundaries = [i for i, label in enumerate(example['labels']) if label == 1]
+                
+                logger.info(f"预测边界位置: {pred_boundaries}")
+                logger.info(f"真实边界位置: {true_boundaries}")
             
   
 
-    def _get_detailed_consensus_format(self, predictions, ground_truths, sample_bits):
-        """为特定长度组计算详细的共识格式和统计信息"""
-        if len(predictions) < 2:
-            return "样本不足", "样本不足", None
-        
-        length = len(predictions[0])
-        num_predictions = len(predictions)
-        
-        # 收集每个位置的投票统计
-        position_stats = []
-        consensus_pred_seq = []
-        consensus_gt_seq = []
-        
-        for pos in range(length):
-            pred_votes = sum(seq[pos] for seq in predictions)
-            gt_votes = sum(seq[pos] for seq in ground_truths)
-            
-            pred_boundary = pred_votes >= (num_predictions * 0.5)
-            gt_boundary = gt_votes >= (num_predictions * 0.5)
-            
-            consensus_pred_seq.append(1 if pred_boundary else 0)
-            consensus_gt_seq.append(1 if gt_boundary else 0)
-            
-            position_stats.append({
-                'position': pos,
-                'pred_votes': pred_votes,
-                'gt_votes': gt_votes,
-                'pred_boundary': pred_boundary,
-                'gt_boundary': gt_boundary
-            })
-        
-        # 重构十六进制数据
-        hex_data = ""
-        for i in range(length):
-            byte_bits = sample_bits[i]
-            byte_value = 0
-            for j in range(8):
-                if byte_bits[j] > 0.5:
-                    byte_value |= (1 << (7-j))
-            hex_data += f"{byte_value:02x}"
-        
-        pred_format = self._format_fields(hex_data, consensus_pred_seq)
-        true_format = self._format_fields(hex_data, consensus_gt_seq)
-        
-        detailed_stats = {
-            'position_stats': position_stats,
-            'consensus_pred_seq': consensus_pred_seq,
-            'consensus_gt_seq': consensus_gt_seq,
-            'total_samples': num_predictions,
-            'length': length
-        }
-        
-        return pred_format, true_format, detailed_stats
-
-    def _show_voting_statistics(self, detailed_stats, total_samples):
-        """显示详细的投票统计表格"""
-        logger.info(f"\n位置投票统计 (总样本数: {total_samples}):")
-        logger.info("位置  预测投票  真实投票  预测边界  真实边界")
-        logger.info("-" * 50)
-        
-        position_stats = detailed_stats['position_stats']
-        length = detailed_stats['length']
-        
-        # 显示前20个位置，如果超过则显示省略
-        display_limit = 20
-        for i, stats in enumerate(position_stats[:display_limit]):
-            pred_votes = stats['pred_votes']
-            gt_votes = stats['gt_votes']
-            pred_boundary = "是" if stats['pred_boundary'] else "否"
-            gt_boundary = "是" if stats['gt_boundary'] else "否"
-            
-            logger.info(f"{stats['position']:>4}   {pred_votes:>6.1f}     {gt_votes:>6.1f}      {pred_boundary:>2}       {gt_boundary:>2}")
-        
-        if length > display_limit:
-            logger.info(f"... (还有 {length - display_limit} 个位置)")
-
-    def _show_boundary_summary(self, detailed_stats):
-        """显示边界位置摘要"""
-        position_stats = detailed_stats['position_stats']
-        
-        # 提取边界位置
-        pred_boundaries = [stats['position'] for stats in position_stats if stats['pred_boundary']]
-        gt_boundaries = [stats['position'] for stats in position_stats if stats['gt_boundary']]
-        
-        # 计算投票强度统计
-        pred_votes = [stats['pred_votes'] for stats in position_stats]
-        gt_votes = [stats['gt_votes'] for stats in position_stats]
-        
-        logger.info("\n边界位置摘要:")
-        logger.info(f"  预测边界位置: {pred_boundaries}")
-        logger.info(f"  真实边界位置: {gt_boundaries}")
-        
-        if pred_votes:
-            logger.info(f"  预测投票强度: 平均={np.mean(pred_votes):.1f}, "
-                       f"最大={np.max(pred_votes):.1f}, 最小={np.min(pred_votes):.1f}")
-        
-        if gt_votes:
-            logger.info(f"  真实投票强度: 平均={np.mean(gt_votes):.1f}, "
-                       f"最大={np.max(gt_votes):.1f}, 最小={np.min(gt_votes):.1f}")
-        
-        # 计算匹配度
-        pred_set = set(pred_boundaries)
-        gt_set = set(gt_boundaries)
-        
-        correct_boundaries = len(pred_set & gt_set)
-        missed_boundaries = len(gt_set - pred_set)
-        false_boundaries = len(pred_set - gt_set)
-        
-        logger.info(f"  边界匹配情况: 正确={correct_boundaries}, "
-                   f"遗漏={missed_boundaries}, 误报={false_boundaries}")
-        
-        # 计算边界级别的精确率和召回率
-        if len(pred_set) > 0:
-            boundary_precision = correct_boundaries / len(pred_set)
-            logger.info(f"  边界精确率: {boundary_precision:.3f}")
-        
-        if len(gt_set) > 0:
-            boundary_recall = correct_boundaries / len(gt_set)
-            logger.info(f"  边界召回率: {boundary_recall:.3f}")
-
-    
-
-    def _get_consensus_format_for_group(self, predictions, ground_truths, sample_bits):
-        """为特定长度组计算共识格式"""
-        if len(predictions) < 2:
-            return "样本不足", "样本不足"
-        
-        length = len(predictions[0])
-        num_predictions = len(predictions)
-        consensus_pred_seq = []
-        consensus_gt_seq = []
-        
-        for pos in range(length):
-            pred_votes = sum(seq[pos] for seq in predictions)
-            consensus_pred_seq.append(1 if pred_votes >= (num_predictions * 0.5) else 0)
-            
-            gt_votes = sum(seq[pos] for seq in ground_truths)
-            consensus_gt_seq.append(1 if gt_votes >= (num_predictions * 0.5) else 0)
-        
-        # 重构十六进制数据
-        hex_data = ""
-        for i in range(length):
-            byte_bits = sample_bits[i]
-            byte_value = 0
-            for j in range(8):
-                if byte_bits[j] > 0.5:
-                    byte_value |= (1 << (7-j))
-            hex_data += f"{byte_value:02x}"
-        
-        pred_format = self._format_fields(hex_data, consensus_pred_seq)
-        true_format = self._format_fields(hex_data, consensus_gt_seq)
-        
-        return pred_format, true_format
 
     def _format_fields(self, hex_data, boundary_seq):
         """根据边界序列格式化字段"""
@@ -964,7 +693,7 @@ def run_cross_validation():
     logger.info("开始留一法交叉验证实验")
     logger.info(f"目标协议: {target_protocols}")
     logger.info("="*80)
-    logger.info("使用共识评估模式")
+    logger.info("使用单条流量评估模式 (协议内微平均 + 协议间宏平均)")
     
     # 检查是否需要预处理数据
     preprocessor = NetworkPacketPreprocessor()
@@ -1054,6 +783,7 @@ def run_cross_validation():
     if all_results:
         logger.info("\n" + "="*80)
         logger.info(f"留一法交叉验证最终结果汇总 - {model_name}")
+        logger.info("评估策略: 协议内微平均 + 协议间宏平均")
         logger.info("="*80)
         
         f1_scores = []
@@ -1068,16 +798,17 @@ def run_cross_validation():
                        f"Precision: {metrics['precision']:.4f}, "
                        f"Recall: {metrics['recall']:.4f}")
         
-        # 计算平均指标
+        # 计算宏平均指标（协议间平均）
         avg_f1 = np.mean(f1_scores)
         avg_precision = np.mean(precision_scores)
         avg_recall = np.mean(recall_scores)
         std_f1 = np.std(f1_scores)
         
         logger.info("-" * 80)
-        logger.info(f"{'平均':>8} - F1: {avg_f1:.4f}±{std_f1:.4f}, "
+        logger.info(f"{'宏平均':>8} - F1: {avg_f1:.4f}±{std_f1:.4f}, "
                    f"Precision: {avg_precision:.4f}, "
                    f"Recall: {avg_recall:.4f}")
+        logger.info("说明: 每个协议内使用微平均，协议间使用宏平均")
         logger.info("="*80)
 
 

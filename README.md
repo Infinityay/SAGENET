@@ -9,16 +9,25 @@ We summarize the major setup instructions as follows:
 pip install -r requirements.txt
 
 # Data preparation
-python 1_pcap2protocol.py
-python 2_protocol2json.py
-python 3_json2formatted.py
-python preparation.py
+python 1_pcap2protocol.py    # Extract protocol-specific pcaps from mixed pcap files
+                              # → Generates: ./data/protocol/tcp.pcap, dns.pcap, etc.
+
+python 2_protocol2json.py    # Convert pcap files to JSON and JSONraw formats
+                              # → Generates: ./data/processed/json/*.json, ./data/processed/jsonraw/*_raw.json
+
+python 3_json2formatted.py   # Transform JSON data into formatted training data
+                              # → Generates: ./data/formatted/*.json with bit matrices and labels
+
+python preparation.py        # Generate cross-validation datasets for training
+                              # → Generates: ./dataset/
 
 # Training
-python train.py
+python train.py              # Train the model with cross-validation
+                              
 
 # Ablation study
-python comprehensive_ablation.py
+python comprehensive_ablation.py  # Run ablation experiments
+                                   
 ```
 
 
